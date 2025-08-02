@@ -1,12 +1,16 @@
 use codex_core::config_types::SandboxMode;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::EventMsg;
+use codex_core::protocol::InputItem;
 use serde::Deserialize;
 use serde::Serialize;
 use strum_macros::Display;
 use uuid::Uuid;
 
+use mcp_types::CallToolResult;
+use mcp_types::ContentBlock;
 use mcp_types::RequestId;
+use mcp_types::TextContent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -21,7 +25,7 @@ pub struct MessageId(pub Uuid);
 pub struct ToolCallRequest {
     #[serde(rename = "jsonrpc")]
     pub jsonrpc: &'static str,
-    pub id: u64,
+    pub id: RequestId,
     pub method: &'static str,
     pub params: ToolCallRequestParams,
 }
@@ -38,7 +42,7 @@ pub enum ToolCallRequestParams {
 impl ToolCallRequestParams {
     /// Wrap this request in a JSON-RPC request.
     #[allow(dead_code)]
-    pub fn into_request(self, id: u64) -> ToolCallRequest {
+    pub fn into_request(self, id: RequestId) -> ToolCallRequest {
         ToolCallRequest {
             jsonrpc: "2.0",
             id,
@@ -95,70 +99,13 @@ pub struct ConversationStreamArgs {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConversationSendMessageArgs {
     pub conversation_id: ConversationId,
-    pub content: Vec<MessageInputItem>,
+    pub content: Vec<InputItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_message_id: Option<MessageId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(flatten)]
     pub conversation_overrides: Option<ConversationOverrides>,
 }
-
-/// Input items for a message.
-/// Following OpenAI's Responses API: https://platform.openai.com/docs/api-reference/responses
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum MessageInputItem {
-    Text {
-        text: String,
-    },
-    Image {
-        #[serde(flatten)]
-        source: ImageSource,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        detail: Option<ImageDetail>,
-    },
-    File {
-        #[serde(flatten)]
-        source: FileSource,
-    },
-}
-
-/// Source of an image.
-/// Following OpenAI's API: https://platform.openai.com/docs/guides/images-vision#giving-a-model-images-as-input
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ImageSource {
-    ImageUrl { image_url: String },
-    FileId { file_id: String },
-}
-
-/// Source of a file.
-/// Following OpenAI's Responses API: https://platform.openai.com/docs/guides/pdf-files?api-mode=responses#uploading-files
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum FileSource {
-    Url {
-        file_url: String,
-    },
-    Id {
-        file_id: String,
-    },
-    Base64 {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        filename: Option<String>,
-        // Base64-encoded file contents.
-        file_data: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ImageDetail {
-    Low,
-    High,
-    Auto,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConversationsListArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,8 +121,45 @@ pub struct ToolCallResponse {
     pub request_id: RequestId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", flatten)]
     pub result: Option<ToolCallResponseResult>,
+}
+
+impl From<ToolCallResponse> for CallToolResult {
+    fn from(val: ToolCallResponse) -> Self {
+        let ToolCallResponse {
+            request_id: _request_id,
+            is_error,
+            result,
+        } = val;
+        match result {
+            Some(res) => match serde_json::to_value(&res) {
+                Ok(v) => CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        r#type: "text".to_string(),
+                        text: v.to_string(),
+                        annotations: None,
+                    })],
+                    is_error,
+                    structured_content: Some(v),
+                },
+                Err(e) => CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        r#type: "text".to_string(),
+                        text: format!("Failed to serialize tool result: {e}"),
+                        annotations: None,
+                    })],
+                    is_error: Some(true),
+                    structured_content: None,
+                },
+            },
+            None => CallToolResult {
+                content: vec![],
+                is_error,
+                structured_content: None,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -188,17 +172,26 @@ pub enum ToolCallResponseResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ConversationCreateResult {
-    pub conversation_id: ConversationId,
-    pub model: String,
+#[serde(untagged)]
+pub enum ConversationCreateResult {
+    Ok {
+        conversation_id: ConversationId,
+        model: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConversationStreamResult {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ConversationSendMessageResult {
-    pub success: bool,
+// TODO: remove this status because we have is_error field in the response.
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum ConversationSendMessageResult {
+    Ok,
+    Error { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -303,6 +296,8 @@ pub enum ClientNotification {
 #[allow(clippy::expect_used)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use codex_core::protocol::McpInvocation;
     use codex_core::protocol::McpToolCallBeginEvent;
@@ -331,7 +326,7 @@ mod tests {
             base_instructions: None,
         });
 
-        let observed = to_val(&req.into_request(2));
+        let observed = to_val(&req.into_request(mcp_types::RequestId::Integer(2)));
         let expected = json!({
             "jsonrpc": "2.0",
             "id": 2,
@@ -354,18 +349,12 @@ mod tests {
         let req = ToolCallRequestParams::ConversationSendMessage(ConversationSendMessageArgs {
             conversation_id: ConversationId(uuid!("d0f6ecbe-84a2-41c1-b23d-b20473b25eab")),
             content: vec![
-                MessageInputItem::Text { text: "Hi".into() },
-                MessageInputItem::Image {
-                    source: ImageSource::ImageUrl {
-                        image_url: "https://example.com/cat.jpg".into(),
-                    },
-                    detail: Some(ImageDetail::High),
+                InputItem::Text { text: "Hi".into() },
+                InputItem::Image {
+                    image_url: "https://example.com/cat.jpg".into(),
                 },
-                MessageInputItem::File {
-                    source: FileSource::Base64 {
-                        filename: Some("notes.txt".into()),
-                        file_data: "Zm9vYmFy".into(),
-                    },
+                InputItem::LocalImage {
+                    path: "notes.txt".into(),
                 },
             ],
             parent_message_id: Some(MessageId(uuid!("67e55044-10b1-426f-9247-bb680e5fe0c8"))),
@@ -380,7 +369,7 @@ mod tests {
             }),
         });
 
-        let observed = to_val(&req.into_request(2));
+        let observed = to_val(&req.into_request(mcp_types::RequestId::Integer(2)));
         let expected = json!({
             "jsonrpc": "2.0",
             "id": 2,
@@ -391,8 +380,8 @@ mod tests {
                     "conversation_id": "d0f6ecbe-84a2-41c1-b23d-b20473b25eab",
                     "content": [
                         { "type": "text", "text": "Hi" },
-                        { "type": "image", "image_url": "https://example.com/cat.jpg", "detail": "high" },
-                        { "type": "file", "filename": "notes.txt", "file_data": "Zm9vYmFy" }
+                        { "type": "image", "image_url": "https://example.com/cat.jpg" },
+                        { "type": "local_image", "path": "notes.txt" }
                     ],
                     "parent_message_id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                     "model": "o4-mini",
@@ -414,7 +403,7 @@ mod tests {
             cursor: Some("abc".into()),
         });
 
-        let observed = to_val(&req.into_request(2));
+        let observed = to_val(&req.into_request(RequestId::Integer(2)));
         let expected = json!({
             "jsonrpc": "2.0",
             "id": 2,
@@ -436,7 +425,7 @@ mod tests {
             conversation_id: ConversationId(uuid!("67e55044-10b1-426f-9247-bb680e5fe0c8")),
         });
 
-        let observed = to_val(&req.into_request(2));
+        let observed = to_val(&req.into_request(mcp_types::RequestId::Integer(2)));
         let expected = json!({
             "jsonrpc": "2.0",
             "id": 2,
@@ -454,48 +443,44 @@ mod tests {
     // ----- Message inputs / sources -----
 
     #[test]
-    fn serialize_message_input_image_file_id_auto_detail() {
-        let item = MessageInputItem::Image {
-            source: ImageSource::FileId {
-                file_id: "file_123".into(),
-            },
-            detail: Some(ImageDetail::Auto),
+    fn serialize_message_input_image_url() {
+        let item = InputItem::Image {
+            image_url: "https://example.com/x.png".into(),
         };
         let observed = to_val(&item);
         let expected = json!({
             "type": "image",
-            "file_id": "file_123",
-            "detail": "auto"
+            "image_url": "https://example.com/x.png"
         });
         assert_eq!(observed, expected);
     }
 
     #[test]
-    fn serialize_message_input_file_url_and_id_variants() {
-        let url = MessageInputItem::File {
-            source: FileSource::Url {
-                file_url: "https://example.com/a.pdf".into(),
-            },
+    fn serialize_message_input_local_image_path() {
+        let url = InputItem::LocalImage {
+            path: PathBuf::from("https://example.com/a.pdf"),
         };
-        let id = MessageInputItem::File {
-            source: FileSource::Id {
-                file_id: "file_456".into(),
-            },
+        let id = InputItem::LocalImage {
+            path: PathBuf::from("file_456"),
         };
+        let observed_url = to_val(&url);
+        let expected_url = json!({"type":"local_image","path":"https://example.com/a.pdf"});
         assert_eq!(
-            to_val(&url),
-            json!({"type":"file","file_url":"https://example.com/a.pdf"})
+            observed_url, expected_url,
+            "LocalImage with URL path should serialize as image_url"
         );
-        assert_eq!(to_val(&id), json!({"type":"file","file_id":"file_456"}));
+        let observed_id = to_val(&id);
+        let expected_id = json!({"type":"local_image","path":"file_456"});
+        assert_eq!(
+            observed_id, expected_id,
+            "LocalImage with file id should serialize as image_url"
+        );
     }
 
     #[test]
     fn serialize_message_input_image_url_without_detail() {
-        let item = MessageInputItem::Image {
-            source: ImageSource::ImageUrl {
-                image_url: "https://example.com/x.png".into(),
-            },
-            detail: None,
+        let item = InputItem::Image {
+            image_url: "https://example.com/x.png".into(),
         };
         let observed = to_val(&item);
         let expected = json!({
@@ -513,16 +498,19 @@ mod tests {
             request_id: RequestId::Integer(1),
             is_error: None,
             result: Some(ToolCallResponseResult::ConversationCreate(
-                ConversationCreateResult {
+                ConversationCreateResult::Ok {
                     conversation_id: ConversationId(uuid!("d0f6ecbe-84a2-41c1-b23d-b20473b25eab")),
                     model: "o3".into(),
                 },
             )),
         };
-        let observed = to_val(&env);
+        let req_id = env.request_id.clone();
+        let observed = to_val(&CallToolResult::from(env));
         let expected = json!({
-            "requestId": 1,
-            "result": {
+            "content": [
+                { "type": "text", "text": "{\"conversation_id\":\"d0f6ecbe-84a2-41c1-b23d-b20473b25eab\",\"model\":\"o3\"}" }
+            ],
+            "structuredContent": {
                 "conversation_id": "d0f6ecbe-84a2-41c1-b23d-b20473b25eab",
                 "model": "o3"
             }
@@ -531,6 +519,36 @@ mod tests {
             observed, expected,
             "response (ConversationCreate) must match"
         );
+        assert_eq!(req_id, RequestId::Integer(1));
+    }
+
+    #[test]
+    fn response_error_conversation_create_full_schema() {
+        let env = ToolCallResponse {
+            request_id: RequestId::Integer(2),
+            is_error: Some(true),
+            result: Some(ToolCallResponseResult::ConversationCreate(
+                ConversationCreateResult::Error {
+                    message: "Failed to initialize session".into(),
+                },
+            )),
+        };
+        let req_id = env.request_id.clone();
+        let observed = to_val(&CallToolResult::from(env));
+        let expected = json!({
+            "content": [
+                { "type": "text", "text": "{\"message\":\"Failed to initialize session\"}" }
+            ],
+            "isError": true,
+            "structuredContent": {
+                "message": "Failed to initialize session"
+            }
+        });
+        assert_eq!(
+            observed, expected,
+            "error response (ConversationCreate) must match"
+        );
+        assert_eq!(req_id, RequestId::Integer(2));
     }
 
     #[test]
@@ -542,15 +560,17 @@ mod tests {
                 ConversationStreamResult {},
             )),
         };
-        let observed = to_val(&env);
+        let req_id = env.request_id.clone();
+        let observed = to_val(&CallToolResult::from(env));
         let expected = json!({
-            "requestId": 2,
-            "result": {}
+            "content": [ { "type": "text", "text": "{}" } ],
+            "structuredContent": {}
         });
         assert_eq!(
             observed, expected,
             "response (ConversationStream) must have empty object result"
         );
+        assert_eq!(req_id, RequestId::Integer(2));
     }
 
     #[test]
@@ -559,18 +579,20 @@ mod tests {
             request_id: RequestId::Integer(3),
             is_error: None,
             result: Some(ToolCallResponseResult::ConversationSendMessage(
-                ConversationSendMessageResult { success: true },
+                ConversationSendMessageResult::Ok,
             )),
         };
-        let observed = to_val(&env);
+        let req_id = env.request_id.clone();
+        let observed = to_val(&CallToolResult::from(env));
         let expected = json!({
-            "requestId": 3,
-            "result": { "success": true }
+            "content": [ { "type": "text", "text": "{\"status\":\"ok\"}" } ],
+            "structuredContent": { "status": "ok" }
         });
         assert_eq!(
             observed, expected,
             "response (ConversationSendMessageAccepted) must match"
         );
+        assert_eq!(req_id, RequestId::Integer(3));
     }
 
     #[test]
@@ -590,10 +612,13 @@ mod tests {
                 },
             )),
         };
-        let observed = to_val(&env);
+        let req_id = env.request_id.clone();
+        let observed = to_val(&CallToolResult::from(env));
         let expected = json!({
-            "requestId": 4,
-            "result": {
+            "content": [
+                { "type": "text", "text": "{\"conversations\":[{\"conversation_id\":\"67e55044-10b1-426f-9247-bb680e5fe0c8\",\"title\":\"Refactor config loader\"}],\"next_cursor\":\"next123\"}" }
+            ],
+            "structuredContent": {
                 "conversations": [
                     {
                         "conversation_id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
@@ -607,6 +632,7 @@ mod tests {
             observed, expected,
             "response (ConversationsList with cursor) must match"
         );
+        assert_eq!(req_id, RequestId::Integer(4));
     }
 
     #[test]
@@ -616,15 +642,17 @@ mod tests {
             is_error: Some(true),
             result: None,
         };
-        let observed = to_val(&env);
+        let req_id = env.request_id.clone();
+        let observed = to_val(&CallToolResult::from(env));
         let expected = json!({
-            "requestId": 4,
+            "content": [],
             "isError": true
         });
         assert_eq!(
             observed, expected,
             "error response must omit `result` and include `isError`"
         );
+        assert_eq!(req_id, RequestId::Integer(4));
     }
 
     // ----- Notifications -----
