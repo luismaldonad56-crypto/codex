@@ -54,6 +54,7 @@ pub(crate) struct EventProcessorWithHumanOutput {
     red: Style,
     green: Style,
     cyan: Style,
+    blue: Style,
 
     /// Whether to include `AgentReasoning` events in the output.
     show_agent_reasoning: bool,
@@ -84,6 +85,7 @@ impl EventProcessorWithHumanOutput {
                 red: Style::new().red(),
                 green: Style::new().green(),
                 cyan: Style::new().cyan(),
+                blue: Style::new().blue(),
                 show_agent_reasoning: !config.hide_agent_reasoning,
                 show_raw_agent_reasoning: config.show_raw_agent_reasoning,
                 answer_started: false,
@@ -102,6 +104,7 @@ impl EventProcessorWithHumanOutput {
                 red: Style::new(),
                 green: Style::new(),
                 cyan: Style::new(),
+                blue: Style::new(),
                 show_agent_reasoning: !config.hide_agent_reasoning,
                 show_raw_agent_reasoning: config.show_raw_agent_reasoning,
                 answer_started: false,
@@ -263,13 +266,32 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                         command: command.clone(),
                     },
                 );
-                ts_println!(
-                    self,
-                    "{} {} in {}",
-                    "exec".style(self.magenta),
-                    escape_command(&command).style(self.bold),
-                    cwd.to_string_lossy(),
-                );
+
+                // Try to classify as read_file and print a friendlier line if matched.
+                if let Some(entries) = classify_read_file(&command) {
+                    for e in entries {
+                        let mut line = format!(
+                            "{} {}",
+                            "📖".to_string() + " " + &format!("{}", "Read".style(self.bold)),
+                            e.filename.style(self.blue)
+                        );
+                        if let Some(count) = e.line_count {
+                            line.push_str(&format!(
+                                " {}",
+                                format!("({} lines)", count).style(self.dimmed)
+                            ));
+                        }
+                        ts_println!(self, "{}", line);
+                    }
+                } else {
+                    ts_println!(
+                        self,
+                        "{} {} in {}",
+                        "exec".style(self.magenta),
+                        escape_command(&command).style(self.bold),
+                        cwd.to_string_lossy(),
+                    );
+                }
             }
             EventMsg::ExecCommandOutputDelta(_) => {}
             EventMsg::ExecCommandEnd(ExecCommandEndEvent {
@@ -553,4 +575,157 @@ fn format_mcp_invocation(invocation: &McpInvocation) -> String {
     } else {
         format!("{fq_tool_name}({args_str})")
     }
+}
+
+// Helper types and functions to detect read_file style commands
+struct ReadEntry {
+    filename: String,
+    line_count: Option<usize>,
+}
+
+fn classify_read_file(command: &Vec<String>) -> Option<Vec<ReadEntry>> {
+    // Handle common form: ["bash", "-lc", SCRIPT]
+    let script = match command.as_slice() {
+        [first, second, third] if first == "bash" && second == "-lc" => Some(third.as_str()),
+        // Direct sed/cat commands without bash -lc
+        _ => None,
+    };
+
+    // Attempt direct forms first if not bash -lc
+    if script.is_none() {
+        if let Some(e) = parse_single_command_tokens(command) {
+            return Some(vec![e]);
+        }
+        return None;
+    }
+
+    let script = script.unwrap();
+    let mut entries: Vec<ReadEntry> = Vec::new();
+
+    // Extract occurrences of: sed -n 'start,endp' <file>
+    let mut i = 0usize;
+    while let Some(pos) = script[i..].find("sed -n ") {
+        let base = i + pos + "sed -n ".len();
+        // Expect starting quote
+        if let Some(qpos) = script[base..].find('\'') {
+            let qstart = base + qpos + 1; // after opening quote
+            if let Some(qend_rel) = script[qstart..].find('\'') {
+                let qend = qstart + qend_rel;
+                let range = &script[qstart..qend];
+                // Expect format: start,endp
+                if let Some(pidx) = range.find('p') {
+                    let pair = &range[..pidx];
+                    if let Some((a, b)) = pair.split_once(',') {
+                        if let (Ok(start), Ok(end)) =
+                            (a.trim().parse::<usize>(), b.trim().parse::<usize>())
+                        {
+                            // After closing quote, try to parse filename token (until whitespace or separator)
+                            let after = &script[qend + 1..];
+                            let file = after
+                                .trim_start()
+                                .split(|c: char| {
+                                    c.is_whitespace() || c == ';' || c == '|' || c == '&'
+                                })
+                                .find(|s| !s.is_empty());
+
+                            if let Some(f) = file {
+                                entries.push(ReadEntry {
+                                    filename: f.to_string(),
+                                    line_count: Some(end.saturating_sub(start).saturating_add(1)),
+                                });
+                            } else {
+                                // Try to find preceding `nl -ba <file> | sed -n` pattern
+                                if let Some(prev_pos) = script[..pos + i].rfind("nl -ba ") {
+                                    let after_nl = &script[prev_pos + "nl -ba ".len()..];
+                                    let fname = after_nl
+                                        .split(|c: char| c.is_whitespace() || c == '|' || c == ';')
+                                        .next()
+                                        .unwrap_or("");
+                                    if !fname.is_empty() {
+                                        entries.push(ReadEntry {
+                                            filename: fname.to_string(),
+                                            line_count: Some(
+                                                end.saturating_sub(start).saturating_add(1),
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                i = qend + 1;
+                continue;
+            }
+        }
+        i = base;
+    }
+
+    // Also detect simple `cat <file>` forms in the script
+    // This is a naive scan; it may find multiple cats – we include each as full-file reads.
+    let mut j = 0usize;
+    while let Some(pos) = script[j..].find("cat ") {
+        let after = &script[j + pos + 4..];
+        let token = after
+            .split(|c: char| c.is_whitespace() || c == ';' || c == '|' || c == '&')
+            .next()
+            .unwrap_or("");
+        if !token.is_empty() {
+            entries.push(ReadEntry {
+                filename: token.to_string(),
+                line_count: None,
+            });
+        }
+        j = j + pos + 4;
+    }
+
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
+}
+
+fn parse_single_command_tokens(command: &Vec<String>) -> Option<ReadEntry> {
+    // Handle direct `sed -n 'a,bp' file` or `cat file`
+    if command.first().map(|s| s.as_str()) == Some("cat") && command.len() >= 2 {
+        return Some(ReadEntry {
+            filename: command[1].clone(),
+            line_count: None,
+        });
+    }
+    if command.first().map(|s| s.as_str()) == Some("sed") {
+        // Expect: sed -n 'a,bp' file
+        let mut filename: Option<String> = None;
+        let mut start: Option<usize> = None;
+        let mut end: Option<usize> = None;
+        for (idx, tok) in command.iter().enumerate() {
+            if tok == "-n" {
+                // next token should be the quoted range
+                if let Some(range_tok) = command.get(idx + 1) {
+                    let t = range_tok.trim_matches('\'');
+                    if let Some(pidx) = t.find('p') {
+                        let pair = &t[..pidx];
+                        if let Some((a, b)) = pair.split_once(',') {
+                            start = a.trim().parse::<usize>().ok();
+                            end = b.trim().parse::<usize>().ok();
+                        }
+                    }
+                }
+            }
+        }
+        // filename is typically the last token
+        if let Some(last) = command.last() {
+            if !last.starts_with('-') && !last.starts_with('"') && !last.starts_with('\'') {
+                filename = Some(last.clone());
+            }
+        }
+        if let (Some(f), Some(a), Some(b)) = (filename, start, end) {
+            return Some(ReadEntry {
+                filename: f,
+                line_count: Some(b.saturating_sub(a).saturating_add(1)),
+            });
+        }
+    }
+    None
 }
