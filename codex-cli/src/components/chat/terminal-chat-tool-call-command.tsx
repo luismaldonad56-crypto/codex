@@ -1,5 +1,6 @@
 import { parseApplyPatch } from "../../parse-apply-patch";
 import { shortenPath } from "../../utils/short-path";
+import { extractReadFileSummaries, formatReadLabel } from "../../utils/command-classifier";
 import chalk from "chalk";
 import { Text } from "ink";
 import React from "react";
@@ -30,6 +31,59 @@ export function TerminalChatToolCallCommand({
       return line;
     })
     .join("\n");
+
+  const readSummaries = React.useMemo(
+    () => extractReadFileSummaries(commandForDisplay).map(formatReadLabel),
+    [commandForDisplay],
+  );
+
+  if (readSummaries.length > 0) {
+    return (
+      <>
+        {readSummaries.map((r, idx) => (
+          <Text key={idx}>
+            📖 <Text bold>Read</Text> <Text color="blueBright">{shortenPath(r.name || ".")}</Text>
+            {!r.full && typeof r.lines === "number" ? (
+              <Text dimColor>{` (${r.lines} lines)`}</Text>
+            ) : null}
+          </Text>
+        ))}
+        {explanation && (
+          <>
+            <Text bold color="yellow">
+              Explanation
+            </Text>
+            {explanation.split("\n").map((line, i) => {
+              // Apply different styling to headings (numbered items)
+              if (line.match(/^\d+\.\s+/)) {
+                return (
+                  <Text key={i} bold color="cyan">
+                    {line}
+                  </Text>
+                );
+              } else if (line.match(/^\s*\*\s+/)) {
+                // Style bullet points
+                return (
+                  <Text key={i} color="magenta">
+                    {line}
+                  </Text>
+                );
+              } else if (line.match(/^(WARNING|CAUTION|NOTE):/i)) {
+                // Style warnings
+                return (
+                  <Text key={i} bold color="red">
+                    {line}
+                  </Text>
+                );
+              } else {
+                return <Text key={i}>{line}</Text>;
+              }
+            })}
+          </>
+        )}
+      </>
+    );
+  }
 
   return (
     <>

@@ -13,6 +13,8 @@ import type { FileOpenerScheme } from "src/utils/config";
 import { useTerminalSize } from "../../hooks/use-terminal-size";
 import { collapseXmlBlocks } from "../../utils/file-tag-utils";
 import { parseToolCall, parseToolCallOutput } from "../../utils/parsers";
+import { extractReadFileSummaries, formatReadLabel } from "../../utils/command-classifier";
+import { shortenPath } from "../../utils/short-path";
 import chalk, { type ForegroundColorName } from "chalk";
 import { Box, Text } from "ink";
 import { parse, setOptions } from "marked";
@@ -185,15 +187,34 @@ function TerminalChatResponseToolCall({
     workdir = action.working_directory;
     cmdReadableText = formatCommandForDisplay(action.command);
   }
+
+  // Pretty rendering for read_file commands
+  const readSummaries = React.useMemo(() => {
+    if (!cmdReadableText) return [] as Array<{ name: string; lines?: number; full: boolean }>;
+    return extractReadFileSummaries(cmdReadableText).map(formatReadLabel);
+  }, [cmdReadableText]);
   return (
     <Box flexDirection="column" gap={1}>
       <Text color="magentaBright" bold>
         command
         {workdir ? <Text dimColor>{` (${workdir})`}</Text> : ""}
       </Text>
-      <Text>
-        <Text dimColor>$</Text> {cmdReadableText}
-      </Text>
+      {readSummaries.length > 0 ? (
+        <>
+          {readSummaries.map((r, idx) => (
+            <Text key={idx}>
+              📖 <Text bold>Read</Text> <Text color="blueBright">{shortenPath(r.name || ".")}</Text>
+              {!r.full && typeof r.lines === "number" ? (
+                <Text dimColor>{` (${r.lines} lines)`}</Text>
+              ) : null}
+            </Text>
+          ))}
+        </>
+      ) : (
+        <Text>
+          <Text dimColor>$</Text> {cmdReadableText}
+        </Text>
+      )}
     </Box>
   );
 }
